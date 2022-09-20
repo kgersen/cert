@@ -2,15 +2,17 @@ package cert
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"text/template"
 	"time"
 )
@@ -50,6 +52,9 @@ var userTempl string
 
 var TimeoutSeconds = 3
 
+// IP vesion to use, default is 0 = use system default, 4 or 6 to force a version
+var IPVersion = 0
+
 func SetUserTempl(templ string) error {
 	if templ == "" {
 		return nil
@@ -60,7 +65,7 @@ func SetUserTempl(templ string) error {
 		return err
 	}
 
-	content, err := ioutil.ReadFile(path)
+	content, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
@@ -94,15 +99,16 @@ func SplitHostPort(hostport string) (string, string, error) {
 }
 
 type Cert struct {
-	DomainName string   `json:"domainName"`
-	IP         string   `json:"ip"`
-	Issuer     string   `json:"issuer"`
-	CommonName string   `json:"commonName"`
-	SANs       []string `json:"sans"`
-	NotBefore  string   `json:"notBefore"`
-	NotAfter   string   `json:"notAfter"`
-	Error      string   `json:"error"`
-	certChain  []*x509.Certificate
+	DomainName  string   `json:"domainName"`
+	IP          string   `json:"ip"`
+	Issuer      string   `json:"issuer"`
+	CommonName  string   `json:"commonName"`
+	SANs        []string `json:"sans"`
+	NotBefore   string   `json:"notBefore"`
+	NotAfter    string   `json:"notAfter"`
+	Error       string   `json:"error"`
+	fingerprint string
+	certChain   []*x509.Certificate
 }
 
 func cipherSuite() ([]uint16, error) {
@@ -110,10 +116,9 @@ func cipherSuite() ([]uint16, error) {
 		return nil, nil
 	}
 
-	var cs []uint16
-	cs = []uint16{cipherSuites[CipherSuite]}
+	var cs = []uint16{cipherSuites[CipherSuite]}
 	if cs[0] == 0 {
-		return nil, fmt.Errorf("%s is unsupported cipher suite or tls1.3 cipher suite.", CipherSuite)
+		return nil, fmt.Errorf("%s is unsupported cipher suite or tls1.3 cipher suite", CipherSuite)
 	}
 	return cs, nil
 }
@@ -129,11 +134,20 @@ func tlsVersion() uint16 {
 var serverCert = func(host, port string) ([]*x509.Certificate, string, error) {
 	d := &net.Dialer{
 		Timeout: time.Duration(TimeoutSeconds) * time.Second,
+		Control: func(network string, address string, c syscall.RawConn) error {
+			if IPVersion == 4 && network[len(network)-1] == '6' {
+				return errors.New("bad IP version: want IPv4 got " + network)
+			}
+			if IPVersion == 6 && network[len(network)-1] == '4' {
+				return errors.New("bad IP version: want IPv6 got " + network)
+			}
+			return nil
+		},
 	}
 
 	cs, err := cipherSuite()
 	if err != nil {
-		return []*x509.Certificate{&x509.Certificate{}}, "", err
+		return []*x509.Certificate{{}}, "", err
 	}
 
 	conn, err := tls.DialWithDialer(d, "tcp", host+":"+port, &tls.Config{
@@ -142,7 +156,7 @@ var serverCert = func(host, port string) ([]*x509.Certificate, string, error) {
 		MaxVersion:         tlsVersion(),
 	})
 	if err != nil {
-		return []*x509.Certificate{&x509.Certificate{}}, "", err
+		return []*x509.Certificate{{}}, "", err
 	}
 	defer conn.Close()
 
@@ -171,15 +185,16 @@ func NewCert(hostport string) *Cert {
 	}
 
 	return &Cert{
-		DomainName: host,
-		IP:         ip,
-		Issuer:     cert.Issuer.CommonName,
-		CommonName: cert.Subject.CommonName,
-		SANs:       cert.DNSNames,
-		NotBefore:  cert.NotBefore.In(loc).String(),
-		NotAfter:   cert.NotAfter.In(loc).String(),
-		Error:      "",
-		certChain:  certChain,
+		DomainName:  host,
+		IP:          ip,
+		Issuer:      cert.Issuer.CommonName,
+		CommonName:  cert.Subject.CommonName,
+		SANs:        cert.DNSNames,
+		NotBefore:   cert.NotBefore.In(loc).String(),
+		NotAfter:    cert.NotAfter.In(loc).String(),
+		Error:       "",
+		fingerprint: fmt.Sprintf("% x", sha1.Sum(cert.Raw)),
+		certChain:   certChain,
 	}
 }
 
@@ -197,7 +212,7 @@ var tokens = make(chan struct{}, 128)
 
 func validate(s []string) error {
 	if len(s) < 1 {
-		return fmt.Errorf("Input at least one domain name.")
+		return fmt.Errorf("input at least one domain name")
 	}
 	return nil
 }
@@ -237,7 +252,6 @@ NotAfter:   {{.NotAfter}}
 CommonName: {{.CommonName}}
 SANs:       {{.SANs}}
 Error:      {{.Error}}
-
 {{end}}
 `
 
